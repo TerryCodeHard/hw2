@@ -1,7 +1,12 @@
 """Core classes."""
 from collections import deque
 import random, time
+import warnings
 import numpy as np
+
+
+from keras.callbacks import History
+
 
 
 class Sample:
@@ -42,16 +47,62 @@ class Sample:
         self.next_state = next_state
         self.is_terminal = is_terminal
 
-    def print_exp(self):
-        print('state is: ')
-        print(self.state)
-        print('action is: ')
-        print(self.action)
-        print('reward is: ')
-        print(self.reward)
-        print('is_terminal: ')
-        print(self.is_terminal)
 
+
+
+class RingBuffer(object):
+    def __init__(self, maxlen):
+        self.maxlen = maxlen
+        self.start = 0
+        self.length = 0
+        self.data = [None for _ in range(maxlen)]
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= self.length:
+            raise KeyError()
+        return self.data[(self.start + idx) % self.maxlen]
+
+    def append(self, v):
+        if self.length < self.maxlen:
+            # We have space, simply increase the length.
+            self.length += 1
+        elif self.length == self.maxlen:
+            # No space, "remove" the first item.
+            self.start = (self.start + 1) % self.maxlen
+        else:
+            # This should never happen.
+            raise RuntimeError()
+        self.data[(self.start + self.length - 1) % self.maxlen] = v
+
+    def clear(self):
+        self.length = 0
+        self.data = [None for _ in range(self.maxlen)]
+        self.start = 0
+
+
+# sample indexes by given low and high index, also the number of index we want
+def sample_batch_indexes(low, high, size):
+    if high - low >= size:
+        r = range(low, high)
+
+        batch_idxs = random.sample(r, size)
+    else:
+        # when data is not enough, we oversample
+        warnings.warn('Not enough entries to sample without replacement. Consider increasing your warm-up phase to avoid oversampling!')
+        batch_idxs = np.random.random_integers(low, high - 1, size=size)
+    assert len(batch_idxs) == size
+    return batch_idxs
+
+
+# this is for padding observation with all zero
+def zeroed_observation(observation):
+    if hasattr(observation, 'shape'):
+        return np.zeros(observation.shape)
+    else:
+        assert 1 == 0, 'The input doesn''t have shape property'
 class Preprocessor:
     """Preprocessor base class.
 
@@ -97,6 +148,7 @@ class Preprocessor:
           modified in anyway.
 
         """
+
         return state
 
     def process_state_for_memory(self, state):
@@ -211,7 +263,7 @@ class ReplayMemory:
     clear()
       Reset the memory. Deletes all references to the samples.
     """
-    def __init__(self, max_size, window_length):
+    def __init__(self, max_size, input_shape, window_length, datatype='uint8'):
         """Setup memory.
 
         You should specify the maximum size o the memory. Once the
@@ -222,16 +274,112 @@ class ReplayMemory:
         We recommend using a list as a ring buffer. Just track the
         index where the next sample should be inserted in the list.
         """
+        self.max_size = int(max_size)
+        self.window_length = window_length
+        self.input_shape = input_shape
+        self.datatype = datatype
+        self.actions = RingBuffer(self.max_size)
+        self.rewards = RingBuffer(self.max_size)
+        self.terminals = RingBuffer(self.max_size)
+        self.observations = RingBuffer(self.max_size)
         pass
 
-    def append(self, state, action, reward):
-        raise NotImplementedError('This method should be overridden')
+    def append(self, observation, action, reward, terminal):
+        assert observation.shape == self.input_shape
+        assert observation.dtype == self.datatype
+        self.observations.append(observation)  # 84x84
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.terminals.append(terminal)
 
     def end_episode(self, final_state, is_terminal):
         raise NotImplementedError('This method should be overridden')
 
     def sample(self, batch_size, indexes=None):
-        raise NotImplementedError('This method should be overridden')
+        if indexes is None:
+            # Draw random indexes such that we have at least a single entry before each index.
+            indexes = sample_batch_indexes(0, len(self) - 1, size=batch_size)
+        indexes = np.array(indexes) + 1
+        assert np.min(indexes) >= 1
+        assert np.max(indexes) < len(self)
+        assert len(indexes) == batch_size
+
+        # Create experiences
+        experiences = []
+        for idx in indexes:
+            terminal0 = self.terminals[idx - 2] if idx >= 2 else False
+            while terminal0:
+                # Skip this transition because there is terminal inside this tuple
+                idx = sample_batch_indexes(1, len(self), size=1)[0]
+                terminal0 = self.terminals[idx - 2] if idx >= 2 else False
+            assert 1 <= idx < len(self)
+
+            # create experience with specific window length by reversing the index of tuple in the memory
+            state0 = np.empty([self.input_shape[0], self.input_shape[1], self.window_length], dtype=self.datatype)
+            state1 = np.empty([self.input_shape[0], self.input_shape[1], self.window_length], dtype=self.datatype)
+            state0[:, :, self.window_length - 1] = self.observations[idx - 1]
+
+            cur_len = 1
+            for offset in range(0, self.window_length - 1):  # offset is 0-2
+                current_idx = idx - 2 - offset
+                current_terminal = self.terminals[current_idx - 1] if current_idx - 1 > 0 else False
+                if current_idx < 0 or current_terminal:
+                    break
+                state0[:, :, self.window_length - 2 - offset] = self.observations[current_idx]
+                cur_len += 1
+            while cur_len < self.window_length:
+                # if the experience doesn't have enough previous observation inside the same episode, we pad zero observation
+                state0[:, :, self.window_length - 1 - cur_len] = zeroed_observation(
+                    state0[:, :, self.window_length - 1])
+                cur_len += 1
+            action = self.actions[idx - 1]
+            reward = self.rewards[idx - 1]
+            terminal1 = self.terminals[idx - 1]
+
+            # create the experience for next state by shifting the state by one
+            state1_tmp = np.array([np.copy(x) for x in state0[:, :, 1:]])
+            state1[:, :, 0:self.window_length - 1] = state1_tmp
+            state1[:, :, self.window_length - 1] = self.observations[idx]  # add to the tail
+            assert cur_len == self.window_length
+            assert state1.shape == state0.shape
+
+            experiences.append(Sample(state0, action, reward, state1, terminal1))
+        assert len(experiences) == batch_size
+        return experiences
 
     def clear(self):
-        raise NotImplementedError('This method should be overridden')
+        self.actions.clear()
+        self.observations.clear()
+        self.rewards.clear()
+        self.terminals.clear()
+
+    def get_config(self):
+        config = {
+            'window_length': self.window_length,
+            'max_size': self.max_size,
+        }
+        return config
+
+    @property
+    def nb_entries(self):
+        return len(self)
+
+    def __len__(self):
+        assert len(self.observations) == len(self.actions), 'The length of observation and action \
+           in memory should be equal'
+        assert len(self.actions) == len(self.rewards), 'The length of rewards and action \
+           in memory should be equal'
+        assert len(self.rewards) == len(self.terminals), 'The length of rewards and terminals \
+           in memory should be equal'
+        return len(self.observations)
+
+    def print_tuple(self, index):
+        print('state is: ')
+        print(self.observations[index])
+        print('action is: ')
+        print(self.actions[index])
+        print('reward is: ')
+        print(self.rewards[index])
+        print('is_terminal: ')
+        print(self.terminals[index])
+
